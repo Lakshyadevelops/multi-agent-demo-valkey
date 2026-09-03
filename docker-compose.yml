@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  valkey-blackboard:
+    image: valkey/valkey:latest
+    container_name: valkey-local
+    ports:
+      - "6379:6379"
+    command: valkey-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10

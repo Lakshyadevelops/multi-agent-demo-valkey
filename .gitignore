@@ -1,0 +1,13 @@
+# Python virtual environments & bytecode
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secret credentials
+.env
+
+# OS / Editor artifacts
+.DS_Store
+*.swp
