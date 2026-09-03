@@ -1,7 +1,7 @@
 """
 Interactive Educational Web Dashboard for Autonomous Multi-Agent RCA Swarm.
-Serves a rich, real-time UI showing Valkey Blackboard primitives, LLM reasoning,
-stigmergic event streams, hypothesis leaderboard, and educational callouts.
+Visualizes Valkey Blackboard primitives, Stigmergic Event Streams,
+and the complete step-by-step Agent Trigger & Scratchpad Activity Flow.
 """
 import os
 import json
@@ -9,22 +9,13 @@ import time
 import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 from blackboard import Blackboard
 from telemetry_mock import TelemetryMock
 from llm_reasoner import LLMReasoner
-from agents import (
-    TraceExplorerAgent,
-    DatabaseSleuthAgent,
-    DeployScoutAgent,
-    InfraK8sAgent,
-    SynthesizerArbiter
-)
 
 bb = Blackboard()
 llm = LLMReasoner()
-active_swarm_task = None
-swarm_loop = None
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -38,6 +29,19 @@ HTML_PAGE = """<!DOCTYPE html>
     <style>
         .pulse-border { animation: pulseBorder 2s infinite; }
         @keyframes pulseBorder { 0% { border-color: rgba(59, 130, 246, 0.4); } 50% { border-color: rgba(59, 130, 246, 1); } 100% { border-color: rgba(59, 130, 246, 0.4); } }
+        .step-line::before {
+            content: '';
+            position: absolute;
+            top: 2rem;
+            bottom: -1rem;
+            left: 1.25rem;
+            width: 2px;
+            background: #334155;
+            z-index: 0;
+        }
+        .step-item:last-child .step-line::before {
+            display: none;
+        }
     </style>
 </head>
 <body class="bg-slate-950 text-slate-100 font-sans min-h-screen">
@@ -128,6 +132,23 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- NEW VISUALIZATION SECTION: Agent Trigger & Scratchpad Activity Flow -->
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
+            <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+                <div>
+                    <h3 class="text-base font-bold text-white flex items-center gap-2">
+                        <i class="fa-solid fa-route text-cyan-400"></i> Agent Trigger Timeline & Shared Scratchpad Activity
+                    </h3>
+                    <p class="text-xs text-slate-400">Step-by-step trace of which agent woke up, what telemetry it inspected, its Gemini reasoning, and what it mutated on the Valkey Blackboard.</p>
+                </div>
+                <span class="text-xs font-mono px-3 py-1 bg-slate-800 rounded-full text-slate-300">rca:agent:steps (Valkey List)</span>
+            </div>
+            
+            <div id="agentStepsContainer" class="space-y-4 relative">
+                <div class="text-xs text-slate-500 italic text-center py-8">Awaiting swarm activation... Trigger an incident to view live agent triggers and scratchpad writes.</div>
+            </div>
+        </div>
+
         <!-- Live Blackboard State Grid -->
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
             <!-- Col 1: Leaderboard & Dynamic Confidence -->
@@ -202,10 +223,27 @@ HTML_PAGE = """<!DOCTYPE html>
     </main>
 
     <script>
+        const AGENT_COLORS = {
+            'TraceExplorerAgent': 'from-blue-600 to-cyan-600 text-cyan-300 border-cyan-800',
+            'DatabaseSleuthAgent': 'from-emerald-600 to-teal-600 text-emerald-300 border-emerald-800',
+            'DeployScoutAgent': 'from-amber-600 to-orange-600 text-amber-300 border-amber-800',
+            'InfraK8sAgent': 'from-purple-600 to-indigo-600 text-purple-300 border-purple-800',
+            'SynthesizerArbiter': 'from-rose-600 to-pink-600 text-rose-300 border-rose-800'
+        };
+
+        const AGENT_ICONS = {
+            'TraceExplorerAgent': 'fa-magnifying-glass-chart',
+            'DatabaseSleuthAgent': 'fa-database',
+            'DeployScoutAgent': 'fa-code-branch',
+            'InfraK8sAgent': 'fa-cubes',
+            'SynthesizerArbiter': 'fa-gavel'
+        };
+
         async function fetchState() {
             try {
                 const res = await fetch('/api/state');
                 const data = await res.json();
+                renderAgentSteps(data.agent_steps);
                 renderLeaderboard(data.leaderboard, data.hypotheses);
                 renderHypotheses(data.hypotheses, data.contributors);
                 renderTimeline(data.timeline);
@@ -214,6 +252,62 @@ HTML_PAGE = """<!DOCTYPE html>
             } catch(e) {
                 console.error(e);
             }
+        }
+
+        function renderAgentSteps(steps) {
+            const container = document.getElementById('agentStepsContainer');
+            if (!steps || steps.length === 0) {
+                container.innerHTML = '<div class="text-xs text-slate-500 italic text-center py-8">Awaiting swarm activation... Trigger an incident to view live agent triggers and scratchpad writes.</div>';
+                return;
+            }
+
+            container.innerHTML = steps.map((step, idx) => {
+                const color = AGENT_COLORS[step.agent] || 'from-slate-600 to-slate-700 text-slate-300 border-slate-800';
+                const icon = AGENT_ICONS[step.agent] || 'fa-user-gear';
+                const ts = new Date(step.timestamp).toLocaleTimeString();
+
+                return `
+                <div class="step-item relative flex items-start gap-4">
+                    <div class="step-line flex-shrink-0 z-10">
+                        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr ${color} flex items-center justify-center text-white shadow-md text-sm">
+                            <i class="fa-solid ${icon}"></i>
+                        </div>
+                    </div>
+                    <div class="flex-grow bg-slate-950 border border-slate-800 rounded-xl p-4 shadow-sm space-y-2">
+                        <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-2">
+                            <div class="flex items-center gap-2">
+                                <span class="font-bold text-sm text-white">${step.agent}</span>
+                                <span class="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded bg-slate-800 text-cyan-300 font-mono font-bold">${step.phase}</span>
+                            </div>
+                            <div class="flex items-center gap-3 text-xs text-slate-400">
+                                <span>Trigger: <code class="text-emerald-400 text-[11px] font-mono">${step.trigger_event}</code></span>
+                                <span class="font-mono text-[10px] text-slate-500">${ts}</span>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs pt-1">
+                            <div class="bg-slate-900/80 p-2.5 rounded-lg border border-slate-800">
+                                <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">
+                                    <i class="fa-solid fa-eye text-cyan-400 mr-1"></i> Telemetry Inspected
+                                </span>
+                                <p class="text-slate-300 font-mono text-[11px] leading-relaxed">${step.telemetry_inspected}</p>
+                            </div>
+                            <div class="bg-slate-900/80 p-2.5 rounded-lg border border-slate-800">
+                                <span class="text-[10px] font-bold text-purple-400 uppercase tracking-wider block mb-1">
+                                    <i class="fa-solid fa-brain text-purple-400 mr-1"></i> Gemini 3.5 Flash Reasoning
+                                </span>
+                                <p class="text-slate-200 text-[11px] leading-relaxed">${step.reasoning}</p>
+                            </div>
+                            <div class="bg-slate-900/80 p-2.5 rounded-lg border border-slate-800">
+                                <span class="text-[10px] font-bold text-emerald-400 uppercase tracking-wider block mb-1">
+                                    <i class="fa-solid fa-pen-to-square text-emerald-400 mr-1"></i> Blackboard Scratchpad Mutation
+                                </span>
+                                <p class="text-emerald-300 font-mono text-[11px] leading-relaxed">${step.blackboard_mutation}</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>`;
+            }).join('');
         }
 
         function renderLeaderboard(leaderboard, hypotheses) {
@@ -394,12 +488,12 @@ class DashboardServer(BaseHTTPRequestHandler):
             hypotheses = bb.get_all_hypotheses()
             timeline = bb.get_timeline()
             verdict = bb.get_final_verdict() or ""
+            agent_steps = bb.get_agent_steps()
 
             contributors = {}
             for hid in hypotheses:
                 contributors[hid] = bb.get_contributors(hid)
 
-            # Stream events
             stream_events = []
             try:
                 raw_stream = bb.client.xrevrange("stream:rca:events", count=10)
@@ -418,6 +512,7 @@ class DashboardServer(BaseHTTPRequestHandler):
                 "contributors": contributors,
                 "timeline": timeline,
                 "stream_events": stream_events,
+                "agent_steps": agent_steps,
                 "verdict": verdict
             }
             self.wfile.write(json.dumps(state).encode("utf-8"))
@@ -444,7 +539,6 @@ class DashboardServer(BaseHTTPRequestHandler):
             bb.reset_blackboard()
             bb.init_stream()
 
-            # Start swarm execution in background thread
             threading.Thread(target=run_swarm_in_thread, args=(scenario_id,), daemon=True).start()
 
             self.send_response(200)

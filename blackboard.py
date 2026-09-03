@@ -1,6 +1,7 @@
 """
 Redis/Valkey Blackboard implementation for Multi-Agent RCA Swarm.
-Wraps Redis primitives: Streams, Sorted Sets, Hashes, Sets, Strings (Distributed Locks), and Pub/Sub.
+Wraps Redis primitives: Streams, Sorted Sets, Hashes, Sets, Strings (Distributed Locks), Pub/Sub,
+and an Agent Execution & Scratchpad Audit Log.
 """
 import os
 import json
@@ -43,9 +44,9 @@ class Blackboard:
             "rca:timeline",
             "rca:hypotheses",
             "rca:confidence",
-            "rca:final_verdict"
+            "rca:final_verdict",
+            "rca:agent:steps"
         ]
-        # Also clean contributor sets and lock keys
         dynamic_keys = self.client.keys("rca:hypothesis:*:contributors") + self.client.keys("lock:investigate:*")
         all_keys = keys + [k for k in dynamic_keys]
         if all_keys:
@@ -79,11 +80,9 @@ class Blackboard:
     ) -> List[Tuple[str, Dict[str, Any]]]:
         """
         Consumes tasks using XAUTOCLAIM for crash recovery and XREADGROUP for new events.
-        Returns a list of (message_id, parsed_fields).
         """
         results: List[Tuple[str, Dict[str, Any]]] = []
 
-        # 1. Fault tolerance check: XAUTOCLAIM to rescue stranded tasks from crashed workers
         try:
             autoclaimed = self.client.xautoclaim(
                 name=stream_name,
@@ -93,7 +92,6 @@ class Blackboard:
                 start_id="0-0",
                 count=count
             )
-            # autoclaimed returns: [next_start_id, [(msg_id, fields), ...], [deleted_ids...]]
             if len(autoclaimed) > 1 and autoclaimed[1]:
                 for msg_id, fields in autoclaimed[1]:
                     results.append((msg_id, fields))
@@ -103,7 +101,6 @@ class Blackboard:
         if results:
             return results
 
-        # 2. Consume newly delivered events via XREADGROUP
         response = self.client.xreadgroup(
             groupname=group_name,
             consumername=consumer_name,
@@ -154,10 +151,7 @@ class Blackboard:
 
     # --- Hypothesis Operations ---
     def create_hypothesis(self, hypo: Dict[str, Any], initial_confidence: float) -> str:
-        """
-        Store a new hypothesis in rca:hypotheses, seed its confidence score in rca:confidence,
-        and register the creating agent in the contributors set.
-        """
+        """Store a new hypothesis in rca:hypotheses and seed confidence."""
         hypo_id = hypo["id"]
         creator = hypo["creator"]
         self.client.hset("rca:hypotheses", hypo_id, json.dumps(hypo))
@@ -166,22 +160,16 @@ class Blackboard:
         return hypo_id
 
     def get_hypothesis(self, hypo_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch hypothesis data by ID."""
         raw = self.client.hget("rca:hypotheses", hypo_id)
         if raw:
             return json.loads(raw)
         return None
 
     def get_all_hypotheses(self) -> Dict[str, Dict[str, Any]]:
-        """Fetch all hypotheses records."""
         raw_dict = self.client.hgetall("rca:hypotheses")
         return {hid: json.loads(val) for hid, val in raw_dict.items()}
 
     def validate_hypothesis(self, hypo_id: str, agent_id: str, evidence: str, score_delta: float = 30.0) -> float:
-        """
-        Append supporting evidence, increment confidence score,
-        and register agent in the contributors set.
-        """
         hypo = self.get_hypothesis(hypo_id)
         if not hypo:
             raise ValueError(f"Hypothesis {hypo_id} not found")
@@ -197,10 +185,6 @@ class Blackboard:
         return new_score
 
     def refute_hypothesis(self, hypo_id: str, agent_id: str, contradiction: str, score_delta: float = -40.0) -> float:
-        """
-        Append contradiction counter-evidence, decrement confidence score,
-        and update status to REFUTED if score drops below 0.
-        """
         hypo = self.get_hypothesis(hypo_id)
         if not hypo:
             raise ValueError(f"Hypothesis {hypo_id} not found")
@@ -221,46 +205,76 @@ class Blackboard:
         new_hypo: Dict[str, Any],
         initial_confidence: float = 35.0
     ) -> str:
-        """Branch a sub-hypothesis stemming from an investigation."""
         new_id = new_hypo["id"]
         self.create_hypothesis(new_hypo, initial_confidence)
-        # Emit event to notify swarm of branched hypothesis
         self.emit_event("HYPOTHESIS_PROPOSED", {
             "id": new_id,
             "parent_id": parent_id,
             "creator": new_hypo["creator"],
             "target_service": new_hypo["target_service"],
+            "scenario": new_hypo.get("scenario", ""),
             "claim": new_hypo["claim"]
         })
         return new_id
 
     def get_leaderboard(self) -> List[Tuple[str, float]]:
-        """Returns leaderboard of hypotheses sorted by confidence descending."""
         return self.client.zrevrange("rca:confidence", 0, -1, withscores=True)
 
     def get_contributors_count(self, hypo_id: str) -> int:
-        """Return number of unique agent contributors to a hypothesis."""
         return self.client.scard(f"rca:hypothesis:{hypo_id}:contributors")
 
     def get_contributors(self, hypo_id: str) -> List[str]:
-        """Return set of unique agent contributors to a hypothesis."""
         return list(self.client.smembers(f"rca:hypothesis:{hypo_id}:contributors"))
+
+    # --- Agent Execution Lifecycle & Scratchpad Flow ---
+    def record_agent_step(
+        self,
+        agent: str,
+        trigger_event: str,
+        phase: str,
+        telemetry_inspected: str,
+        reasoning: str,
+        blackboard_mutation: str,
+        timestamp_ms: Optional[int] = None
+    ):
+        """
+        Records an execution step and scratchpad entry into rca:agent:steps.
+        Enables real-time visualization of who triggered when, what was read, and what was written.
+        """
+        now = timestamp_ms or int(time.time() * 1000)
+        entry = {
+            "timestamp": now,
+            "agent": agent,
+            "trigger_event": trigger_event,
+            "phase": phase,
+            "telemetry_inspected": telemetry_inspected,
+            "reasoning": reasoning,
+            "blackboard_mutation": blackboard_mutation
+        }
+        self.client.rpush("rca:agent:steps", json.dumps(entry))
+
+    def get_agent_steps(self) -> List[Dict[str, Any]]:
+        """Fetch all recorded agent execution and scratchpad steps in chronological order."""
+        raw_list = self.client.lrange("rca:agent:steps", 0, -1)
+        steps = []
+        for raw in raw_list:
+            try:
+                steps.append(json.loads(raw))
+            except Exception:
+                pass
+        return steps
 
     # --- Control & Final Verdict ---
     def publish_control(self, command: str) -> int:
-        """Broadcast control command (e.g. TERMINATE) over Pub/Sub."""
         return self.client.publish("rca:control:broadcast", command)
 
     def get_pubsub_listener(self):
-        """Create a Pub/Sub listener for control broadcast messages."""
         pubsub = self.client.pubsub()
         pubsub.subscribe("rca:control:broadcast")
         return pubsub
 
     def store_final_verdict(self, verdict_md: str):
-        """Save final RCA post-mortem report."""
         self.client.set("rca:final_verdict", verdict_md)
 
     def get_final_verdict(self) -> Optional[str]:
-        """Fetch final RCA post-mortem report."""
         return self.client.get("rca:final_verdict")

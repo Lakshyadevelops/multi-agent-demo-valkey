@@ -1,7 +1,7 @@
 """
 Autonomous Multi-Agent RCA Swarm Actors with Real Gemini 3.5 Flash LLM Reasoning.
 TraceExplorerAgent, DatabaseSleuthAgent, DeployScoutAgent, InfraK8sAgent, and SynthesizerArbiter
-coordinate exclusively via Valkey Blackboard.
+coordinate exclusively via Valkey Blackboard and record every scratchpad & trigger step.
 """
 import os
 import json
@@ -47,7 +47,7 @@ class TraceExplorerAgent(BaseAgent):
     """
     Domain: Distributed traces, ingress spans, cascade latencies.
     Triggers on raw ingress alerts (e.g. 504 Gateway Timeout or 502 Bad Gateway).
-    Isolates slow spans, invokes Gemini to deduce initial hypothesis, records to timeline.
+    Isolates slow spans, invokes Gemini to deduce initial hypothesis, records to timeline & scratchpad.
     """
     def __init__(self, blackboard: Blackboard, llm: LLMReasoner):
         super().__init__("TraceExplorerAgent", blackboard, llm)
@@ -59,24 +59,20 @@ class TraceExplorerAgent(BaseAgent):
         service = fields.get("service", "checkout-gw")
         scenario = fields.get("scenario", "scenario_cache_ttl")
 
-        # Concurrency single-flight check
         if not self.bb.acquire_lock(service, "trace_inspection", self.name, ttl_seconds=15):
             return
 
         try:
-            # 1. Fetch raw telemetry mock
             traces = TelemetryMock.get_trace_data(service, scenario=scenario)
 
-            # 2. Real Gemini LLM Reasoning over distributed trace spans
+            # Gemini Reasoning
             analysis = self.llm.analyze_trace_with_llm(service, traces)
             hypo_id = analysis.get("hypothesis_id", "H_INGRESS_TIMEOUT_INVESTIGATION")
 
-            # Determine downstream target service implicated in traces
             target_service = service
             if traces.get("spans") and len(traces["spans"]) > 1:
                 target_service = traces["spans"][1].get("service", service)
 
-            # 3. Record anomaly to Valkey chronological timeline
             now = int(time.time() * 1000)
             self.bb.record_timeline_anomaly(
                 now,
@@ -84,7 +80,6 @@ class TraceExplorerAgent(BaseAgent):
                 f"Distributed trace {traces.get('trace_id')}: {service} failed. Gemini root cause hypothesis: {analysis.get('claim')}"
             )
 
-            # 4. Create initial hypothesis in Valkey Hashes & Sorted Set
             hypo_data = {
                 "id": hypo_id,
                 "creator": self.name,
@@ -97,7 +92,17 @@ class TraceExplorerAgent(BaseAgent):
             }
             self.bb.create_hypothesis(hypo_data, initial_confidence=50.0)
 
-            # 5. Emit stigmergic event to notify other specialists
+            # Record detailed scratchpad execution step
+            self.bb.record_agent_step(
+                agent=self.name,
+                trigger_event=event_type,
+                phase="INVESTIGATE_TRACES",
+                telemetry_inspected=f"Trace {traces.get('trace_id')} ({traces.get('duration_ms')}ms, HTTP {traces.get('status_code')}). Span count: {len(traces.get('spans', []))}.",
+                reasoning=f"Gemini trace analysis: {analysis.get('claim')}",
+                blackboard_mutation=f"Wrote hypothesis {hypo_id} to rca:hypotheses with initial confidence 50.0. Emitted HYPOTHESIS_PROPOSED to stream:rca:events.",
+                timestamp_ms=now
+            )
+
             self.bb.emit_event("HYPOTHESIS_PROPOSED", {
                 "id": hypo_id,
                 "creator": self.name,
@@ -112,7 +117,7 @@ class TraceExplorerAgent(BaseAgent):
 class DatabaseSleuthAgent(BaseAgent):
     """
     Domain: Postgres connection pools, row locks, slow queries.
-    Uses Gemini LLM to audit DB telemetry and evaluate the active hypothesis.
+    Uses Gemini LLM to audit DB telemetry, record scratchpad findings, and refute/validate hypotheses.
     """
     def __init__(self, blackboard: Blackboard, llm: LLMReasoner):
         super().__init__("DatabaseSleuthAgent", blackboard, llm)
@@ -138,21 +143,21 @@ class DatabaseSleuthAgent(BaseAgent):
             if not current_hypo:
                 return
 
-            # Fetch DB metrics
             db_metrics = TelemetryMock.get_database_metrics(service, scenario=scenario)
 
-            # Real Gemini LLM Audit of database telemetry
+            # Gemini Reasoning
             audit_result = self.llm.audit_database_with_llm(service, db_metrics, current_hypo)
             action = audit_result.get("action", "REFUTE")
             delta = float(audit_result.get("score_delta", -40.0))
             explanation = audit_result.get("explanation", "DB audit completed.")
+            finding = audit_result.get("finding", "")
 
             now = int(time.time() * 1000)
             if action == "REFUTE":
                 new_score = self.bb.refute_hypothesis(
                     hypo_id=hypo_id,
                     agent_id=self.name,
-                    contradiction=f"Gemini DB Audit: {explanation} ({audit_result.get('finding')})",
+                    contradiction=f"Gemini DB Audit: {explanation} ({finding})",
                     score_delta=delta
                 )
                 self.bb.record_timeline_anomaly(
@@ -160,6 +165,7 @@ class DatabaseSleuthAgent(BaseAgent):
                     service,
                     f"DB Telemetry audited by Gemini: Refuted direct DB internal fault. Confidence docked to {new_score:.1f}."
                 )
+                mutation_desc = f"Docked {hypo_id} confidence in rca:confidence ({delta:+0.1f} -> {new_score:.1f}). Status: REFUTED/SCRUTINY. Added to contradictions."
             else:
                 new_score = self.bb.validate_hypothesis(
                     hypo_id=hypo_id,
@@ -172,6 +178,18 @@ class DatabaseSleuthAgent(BaseAgent):
                     service,
                     f"DB Telemetry audited by Gemini: Confirmed database bottleneck (+{delta} -> {new_score:.1f})."
                 )
+                mutation_desc = f"Boosted {hypo_id} confidence in rca:confidence (+{delta:+0.1f} -> {new_score:.1f}). Added to supporting_evidence."
+
+            # Record detailed scratchpad execution step
+            self.bb.record_agent_step(
+                agent=self.name,
+                trigger_event=f"{event_type} ({hypo_id})",
+                phase="AUDIT_DATABASE",
+                telemetry_inspected=f"DB Cluster {db_metrics.get('database_cluster')}: {db_metrics.get('pool_active_connections')}/{db_metrics.get('pool_max_connections')} conns, p99={db_metrics.get('query_metrics', {}).get('p99_latency_ms')}ms, {db_metrics.get('query_metrics', {}).get('active_locks')} locks.",
+                reasoning=f"Gemini verdict: {action}. {explanation}",
+                blackboard_mutation=mutation_desc,
+                timestamp_ms=now
+            )
 
             self.bb.emit_event("HYPOTHESIS_EVALUATED", {
                 "id": hypo_id,
@@ -187,7 +205,7 @@ class DatabaseSleuthAgent(BaseAgent):
 class DeployScoutAgent(BaseAgent):
     """
     Domain: Git commits, CI/CD deploys, feature flag flips.
-    Audits commit history with Gemini; branches root-cause sub-hypothesis if causal commit identified.
+    Audits commit history with Gemini; branches root-cause sub-hypothesis and logs scratchpad step.
     """
     def __init__(self, blackboard: Blackboard, llm: LLMReasoner):
         super().__init__("DeployScoutAgent", blackboard, llm)
@@ -202,7 +220,6 @@ class DeployScoutAgent(BaseAgent):
         if not service:
             return
 
-        # Avoid looping on self-branched hypotheses
         if hypo_id in ("H_CACHE_TTL_ZERO", "H_CONTAINER_OOM_LIMIT", "H_UNINDEXED_MIGRATION_LOCK"):
             return
 
@@ -215,7 +232,6 @@ class DeployScoutAgent(BaseAgent):
             if not deploys:
                 return
 
-            # Real Gemini LLM Audit of Git Diff
             branch_decision = self.llm.audit_deploy_with_llm(service, deploys, current_hypo)
             if branch_decision.get("should_branch"):
                 new_id = branch_decision.get("new_hypothesis_id", f"H_DEPLOY_{service.upper()}")
@@ -230,9 +246,7 @@ class DeployScoutAgent(BaseAgent):
                     "status": "UNDER_SCRUTINY"
                 }
 
-                # Branch in Valkey
                 self.bb.branch_hypothesis(parent_id=hypo_id, new_hypo=new_hypo_data, initial_confidence=45.0)
-                # Boost confidence with git correlation
                 self.bb.validate_hypothesis(
                     hypo_id=new_id,
                     agent_id=self.name,
@@ -246,6 +260,16 @@ class DeployScoutAgent(BaseAgent):
                     service,
                     f"Gemini Git Audit branched {new_id}: {branch_decision.get('claim')[:60]}..."
                 )
+
+                self.bb.record_agent_step(
+                    agent=self.name,
+                    trigger_event=f"{event_type} ({hypo_id})",
+                    phase="AUDIT_GIT_DEPLOY",
+                    telemetry_inspected=f"Git VCS: Commit {deploys[0]['commit_sha']} '{deploys[0]['title']}'. Diff: {deploys[0]['diff_summary']}.",
+                    reasoning=f"Gemini causal link detected: {branch_decision.get('claim')}",
+                    blackboard_mutation=f"Branched new root-cause hypothesis {new_id} in rca:hypotheses from parent {hypo_id}. Seeded rca:confidence to 60.0. Emitted HYPOTHESIS_PROPOSED.",
+                    timestamp_ms=now
+                )
         finally:
             self.bb.release_lock(service, "deploy_inspection", self.name)
 
@@ -253,7 +277,7 @@ class DeployScoutAgent(BaseAgent):
 class InfraK8sAgent(BaseAgent):
     """
     Domain: Container pod restarts, OOMKills, kube-proxy, node CPU/Memory pressure.
-    Audits pod health via Gemini; corroborates application vs infrastructure root causes.
+    Audits pod health via Gemini; corroborates application vs infrastructure root causes and logs scratchpad step.
     """
     def __init__(self, blackboard: Blackboard, llm: LLMReasoner):
         super().__init__("InfraK8sAgent", blackboard, llm)
@@ -275,7 +299,6 @@ class InfraK8sAgent(BaseAgent):
             current_hypo = self.bb.get_hypothesis(hypo_id) or {}
             k8s_metrics = TelemetryMock.get_kubernetes_metrics(service, scenario=scenario)
 
-            # Real Gemini LLM Audit of Kubernetes telemetry
             infra_audit = self.llm.audit_kubernetes_with_llm(service, k8s_metrics, current_hypo)
             score_delta = float(infra_audit.get("score_delta", 30.0))
             evidence = infra_audit.get("evidence", "Kubernetes audit completed.")
@@ -293,6 +316,16 @@ class InfraK8sAgent(BaseAgent):
                 service,
                 f"K8s telemetry audited by Gemini. Corroborated {hypo_id} (+{score_delta:.0f} -> {score:.1f})."
             )
+
+            self.bb.record_agent_step(
+                agent=self.name,
+                trigger_event=f"{event_type} ({hypo_id})",
+                phase="AUDIT_K8S_INFRA",
+                telemetry_inspected=f"Pod metrics for {service}: {k8s_metrics.get('healthy_pods')}/{k8s_metrics.get('pod_count')} healthy, {k8s_metrics.get('restarts_last_hour')} restarts, {k8s_metrics.get('oom_killed_count')} OOMs, CPU={k8s_metrics.get('cpu_utilization_pct')}%, Mem={k8s_metrics.get('memory_utilization_pct')}%.",
+                reasoning=f"Gemini infra audit: {evidence}",
+                blackboard_mutation=f"Corroborated {hypo_id} in rca:confidence (+{score_delta:.0f} -> {score:.1f}). Added {self.name} to rca:hypothesis:{hypo_id}:contributors set.",
+                timestamp_ms=now
+            )
         finally:
             self.bb.release_lock(service, "k8s_infra_inspection", self.name)
 
@@ -301,7 +334,7 @@ class SynthesizerArbiter:
     """
     Role: Convergence sentinel and session supervisor.
     Polls ZREVRANGE rca:confidence 0 0 WITHSCORES.
-    Once confidence >= 85 and contributors >= 2, prompts Gemini to synthesize final report.
+    Once confidence >= 85 and contributors >= 2, prompts Gemini to synthesize final report and records final scratchpad step.
     """
     def __init__(self, blackboard: Blackboard, llm: LLMReasoner, convergence_threshold: float = 85.0, min_contributors: int = 2, timeout_seconds: int = 45):
         self.bb = blackboard
@@ -333,12 +366,23 @@ class SynthesizerArbiter:
         timeline = self.bb.get_timeline()
         hypotheses = self.bb.get_all_hypotheses()
         winning_hypo = hypotheses.get(winner_id, {}) if winner_id else {}
+        contributors = self.bb.get_contributors(winner_id) if winner_id else []
 
-        # Synthesize with real Gemini LLM
         final_verdict = self.llm.synthesize_rca_report(winning_hypo, hypotheses, timeline)
 
-        # Store in Valkey Blackboard & Broadcast TERMINATE
         self.bb.store_final_verdict(final_verdict)
         self.bb.publish_control("TERMINATE")
+
+        now = int(time.time() * 1000)
+        self.bb.record_agent_step(
+            agent="SynthesizerArbiter",
+            trigger_event="CONVERGENCE_CRITERIA_MET",
+            phase="SYNTHESIS_AND_TERMINATION",
+            telemetry_inspected=f"Leaderboard evaluated: {winner_id} score={score}/100, contributors ({len(contributors)}): {', '.join(contributors)}.",
+            reasoning=f"Convergence criteria satisfied (Score >= {self.convergence_threshold} & Contributors >= {self.min_contributors}). Gemini synthesized executive post-mortem.",
+            blackboard_mutation="Saved final markdown post-mortem to rca:final_verdict. Published TERMINATE command to rca:control:broadcast to halt swarm workers.",
+            timestamp_ms=now
+        )
+
         self.running = False
         return final_verdict
